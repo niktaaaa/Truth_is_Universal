@@ -1,4 +1,5 @@
 import torch as t
+import sys
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer, LlamaForCausalLM
 import argparse
 import pandas as pd
@@ -6,9 +7,11 @@ from tqdm import tqdm
 import os
 import configparser
 import glob
+from loguru import logger
 
 config = configparser.ConfigParser()
 config.read('config.ini')
+logger.info("Configuration file loaded.")
 
 class Hook:
     def __init__(self):
@@ -16,26 +19,31 @@ class Hook:
 
     def __call__(self, module, module_inputs, module_outputs):
         self.out, _ = module_outputs
+        logger.debug(f"Hook called on module: {module}, inputs: {module_inputs}, outputs: {module_outputs}")
 
 def load_model(model_family: str, model_size: str, model_type: str, device: str):
     model_path = os.path.join(config[model_family]['weights_directory'], 
                               config[model_family][f'{model_size}_{model_type}_subdir'])
-    
+    logger.info(f"Loading model from {model_path}")
     try:
         if model_family == 'Llama2':
             tokenizer = LlamaTokenizer.from_pretrained(str(model_path))
             model = LlamaForCausalLM.from_pretrained(str(model_path))
             tokenizer.bos_token = '<s>'
         else:
+            logger.debug(f"Loading Llama3 tokenizer")
             tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+            logger.debug(f"Loading Llama3 model")
             model = AutoModelForCausalLM.from_pretrained(str(model_path))
         if model_family == "Gemma2": # Gemma2 requires bfloat16 precision which is only available on new GPUs
             model = model.to(t.bfloat16) # Convert the model to bfloat16 precision
         else:
             model = model.half()  # storing model in float32 precision -> conversion to float16
+        logger.info(f"Model {model_family} loaded successfully.")
+        logger.debug(f"Model details: {model}")
         return tokenizer, model.to(device)
     except Exception as e:
-        print(f"Error loading model: {e}")
+        logger.error(f"Error loading model: {e}")
         raise
 
 def load_statements(dataset_name):
@@ -44,6 +52,8 @@ def load_statements(dataset_name):
     """
     dataset = pd.read_csv(f"datasets/{dataset_name}.csv")
     statements = dataset['statement'].tolist()
+    logger.info(f"Loaded {len(statements)} statements from {dataset_name}.csv")
+    logger.debug(f"Statements: {statements}")
     return statements
 
 def get_acts(statements, tokenizer, model, layers, device):
@@ -57,28 +67,40 @@ def get_acts(statements, tokenizer, model, layers, device):
         hook = Hook()
         handle = model.model.layers[layer].register_forward_hook(hook)
         hooks.append(hook), handles.append(handle)
+        logger.debug(f"Hook registered for layer {layer}")
     
     # get activations
     acts = {layer : [] for layer in layers}
+    logger.info(f"Getting activations for {len(statements)} statements.")
     for statement in tqdm(statements):
+        logger.debug(f"Processing statement: {statement}")
+        logger.debug(f"acts size: {len(acts)}")
+        logger.debug(f"acts memory usage: {sum([act.element_size() for act in acts.values()])}")
         input_ids = tokenizer.encode(statement, return_tensors="pt").to(device)
+        logger.debug(f"Input IDs: {input_ids}")
         model(input_ids)
         for layer, hook in zip(layers, hooks):
             acts[layer].append(hook.out[0, -1])
+            logger.debug(f"Layer {layer} activation shape: {hook.out[0, -1].shape}")
     
     for layer, act in acts.items():
         acts[layer] = t.stack(act).float()
+        logger.info(f"Layer {layer} activations stacked. Shape: {acts[layer].shape}")
+        logger.debug(f"Activations: {acts[layer]}")
     
     # remove hooks
     for handle in handles:
         handle.remove()
+        logger.debug(f"Hook removed for handle {handle}")
     
+    logger.info("Activations collected successfully.")
     return acts
 
 if __name__ == "__main__":
     """
     read statements from dataset, record activations in given layers, and save to specified files
     """
+    logger.info("Starting activation generation process.")
     parser = argparse.ArgumentParser(description="Generate activations for statements in a dataset")
     parser.add_argument("--model_family", default="Llama3", help="Model family to use. Options are Llama2, Llama3, Gemma, Gemma2 or Mistral.")
     parser.add_argument("--model_size", default="8B",
@@ -91,8 +113,13 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", default="acts",
                         help="Directory to save activations to.")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("-l", "--log-level", default="info", choices=["debug", "info", "warning", "error", "critical"], help="Set the logging level. Options are debug, info, warning, error, critical.")
     args = parser.parse_args()
 
+    logger.remove()
+    logger.add(sys.stderr, level=args.log_level.upper())
+    logger.debug(f"Arguments: {args}")
+    
     datasets = args.datasets
     if datasets == ['all_topic_specific']:
         datasets = ['cities', 'sp_en_trans', 'inventors', 'animal_class', 'element_symb', 'facts',
@@ -111,6 +138,7 @@ if __name__ == "__main__":
     tokenizer, model = load_model(args.model_family, args.model_size, args.model_type, args.device)
     
     for dataset in datasets:
+        logger.info(f"Processing dataset: {dataset}")
         statements = load_statements(dataset)
         layers = [int(layer) for layer in args.layers]
         if layers == [-1]:
@@ -118,8 +146,11 @@ if __name__ == "__main__":
         save_dir = f"{args.output_dir}/{args.model_family}/{args.model_size}/{args.model_type}/{dataset}/"
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
+            logger.info(f"Created directory {save_dir}")
 
         for idx in range(0, len(statements), 25):
             acts = get_acts(statements[idx:idx + 25], tokenizer, model, layers, args.device)
             for layer, act in acts.items():
-                    t.save(act, f"{save_dir}/layer_{layer}_{idx}.pt")
+                t.save(act, f"{save_dir}/layer_{layer}_{idx}.pt")
+                logger.info(f"Saved activations for layer {layer}, batch {idx} to {save_dir}/layer_{layer}_{idx}.pt")
+    logger.info("Activation generation process completed.")
